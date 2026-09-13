@@ -28,7 +28,7 @@ module atmos_model_mod
   use mpas_log,              only : mpas_log_write
   use mpas_derived_types,    only : MPAS_LOG_CRIT
   ! UFSATM
-  use module_mpas_config,    only : ic_filename, lbc_filename, oro_filename, nCellsSolve
+  use module_mpas_config,    only : ic_filename, lbc_filename, oro_filename, nCellsSolve, nCellsGlobal
   use module_mpas_config,    only : stream_list_history, stream_list_restart, stream_list_diag
   use module_mpas_config,    only : lonCell, latCell, areaCellGlobal
   use module_mpas_config,    only : mpas_errfile_funit, mpas_errfilename
@@ -280,6 +280,15 @@ contains
     allocate(Cfg % bk(Cfg % levs + 1))
     call ufs_mpas_reference_pressure(Cfg % levs, Cfg % ak, Cfg % bk)
 
+    ! Horizontal-resolution proxy for the GFS physics (lonr/latr = Gaussian-grid points
+    ! around the equator / pole to pole). For a quasi-uniform mesh the number of cells
+    ! around the equator is sqrt(pi*N): 359 for x1.40962 (120 km). Undefined for
+    ! variable-resolution meshes. Consumed by control_initialize via gnx/gny.
+    Cfg % lonr = nint(sqrt(pi * real(nCellsGlobal, kind=MPAS_kind_phys)))
+    Cfg % latr = Cfg % lonr / 2
+    if (Cfg % me == Cfg % master) call mpas_log_write('UGWP resolution proxy: lonr = $i, latr = $i from $i global cells', &
+                                                     intArgs=(/Cfg % lonr, Cfg % latr, nCellsGlobal/))
+
     ! Read in physics namelist and allocate data containers.
     Cfg%fn_nml = nml_filename
     call MPAS_initialize(UFSATM_control, UFSATM_intdiag, UFSATM_grid, UFSATM_tbd, UFSATM_sfcprop, &
@@ -500,7 +509,11 @@ contains
   end subroutine get_number_tracers
   !> #########################################################################################
   !> Internal procedure to get tracer names from the tracer table file.
-  !> ach line of the tracer table is of this format: (a10,a,a40,a,a10,a,i1)
+  !> Each line of the tracer table is comma separated: name, long name, units, type.
+  !> Fields are split on the commas rather than read with fixed widths, because the
+  !> long-name column differs between tracer_table files in circulation (40 vs 51
+  !> characters); a fixed-width read of the wrong file silently misreads the type
+  !> column and gives nwat /= 6.
   !>
   !> #########################################################################################
   subroutine get_tracer_names(funit, fname, ntracers, nwat)
@@ -509,18 +522,28 @@ contains
     integer,          intent(in)    :: ntracers
     integer,          intent(out)   :: nwat
 
-    integer :: itracer, status
+    integer :: itracer, status, i1, i2, i3
+    character(len=256) :: line
     character(len=10) :: tracer_name
-    character(len=1) :: c1,c2,c3
-    character(len=40) :: tracer_long_name
-    character(len=10) :: tracer_unit
     integer :: tracer_type
 
     nwat = 0
     is_water_species(:) = .false.
     open(newunit=funit,file=trim(fname),status='unknown')
     do itracer=1,ntracers
-       read(funit, "(a10,a,a40,a,a10,a,i1)",iostat=status) tracer_name,c1,tracer_long_name,c2,tracer_unit,c3,tracer_type
+       read(funit, "(a)", iostat=status) line
+       if (status /= 0) call mpas_log_write("atmos_model::get_tracer_names ERROR: could not read line $i of "//trim(fname), &
+                                            intArgs=(/itracer/), messageType=MPAS_LOG_CRIT)
+       i1 = index(line, ',')
+       i2 = i1 + index(line(i1+1:), ',')
+       i3 = i2 + index(line(i2+1:), ',')
+       if (i1 == 0 .or. i2 == i1 .or. i3 == i2) &
+            call mpas_log_write("atmos_model::get_tracer_names ERROR: expected 4 comma-separated fields in: "//trim(line), &
+                                messageType=MPAS_LOG_CRIT)
+       tracer_name = adjustl(line(1:i1-1))
+       read(line(i3+1:), *, iostat=status) tracer_type
+       if (status /= 0) call mpas_log_write("atmos_model::get_tracer_names ERROR: bad tracer type in: "//trim(line), &
+                                            messageType=MPAS_LOG_CRIT)
        constituent_name(itracer) = tracer_name
        if (tracer_type == 0) then
           is_water_species(itracer) = .true.

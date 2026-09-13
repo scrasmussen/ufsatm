@@ -28,8 +28,8 @@
       <scheme>GFS_photochemistry</scheme>
       <scheme>GFS_photochemistry_post</scheme>
       <scheme>ugwpv1_gsldrag</scheme>
-      <!-- <scheme>ugwpv1_gsldrag_post</scheme> -->
-      <!-- <scheme>GFS_GWD_generic_post</scheme> -->
+      <scheme>ugwpv1_gsldrag_post</scheme>
+      <scheme>GFS_GWD_generic_post</scheme>
     </subcycle>
   </group>
   <group name="microphysics">

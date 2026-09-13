@@ -119,12 +119,16 @@ contains
              physics_state % ugrs(iCol,iLay)   = ux(iLay,iCol)
              physics_state % vgrs(iCol,iLay)   = uy(iLay,iCol)
 
-             ! Layer geopotential and height.
-             physics_state % phil(iCol,iLay)   = 0.5*(zgrid(iLay+1,iCol)+zgrid(iLay,iCol))*gravity !(m -> m2/s2)
+             ! Layer geopotential and height. CCPP geopotential is relative to the
+             ! model surface (FV3: get_phi_fv3 sets phii(:,1) = 0), so subtract the
+             ! terrain height zgrid(1,:). Schemes use phil/g as height above ground
+             ! (e.g. drag_suite TOFD: zl**(-1.2) -> NaN where the absolute height
+             ! is <= 0, i.e. land below sea level).
+             physics_state % phil(iCol,iLay)   = (0.5*(zgrid(iLay+1,iCol)+zgrid(iLay,iCol)) - zgrid(1,iCol))*gravity !(m -> m2/s2)
              physics_state % zgrid(iCol,iLay)  = 0.5*(zgrid(iLay+1,iCol)+zgrid(iLay,iCol))
 
-             ! Level geopotential and height.
-             physics_state % phii(iCol,iLay)   = zgrid(iLay,iCol)*gravity !(m -> m2/s2)
+             ! Level geopotential (surface-relative) and height.
+             physics_state % phii(iCol,iLay)   = (zgrid(iLay,iCol) - zgrid(1,iCol))*gravity !(m -> m2/s2)
              physics_state % zigrid(iCol,iLay) = zgrid(iLay,iCol)
 
              ! Layer thickness.
@@ -140,7 +144,7 @@ contains
              prsl(iCol,iLay) = pressure_p(iLay,iCol) + pressure_b(iLay,iCol)
           end do
           do iLay = nVertLevels,nVertLevels+1
-             physics_state % phii(iCol,iLay)     = zgrid(iLay,iCol)*gravity !(m -> m2/s2)
+             physics_state % phii(iCol,iLay)     = (zgrid(iLay,iCol) - zgrid(1,iCol))*gravity !(m -> m2/s2)
              physics_state % zigrid(iCol,iLay)   = zgrid(iLay,iCol)
              physics_state % dzgrid(iCol,iLay-1) = zgrid(iLay,iCol) - zgrid(iLay-1,iCol)
           end do
@@ -288,7 +292,7 @@ contains
     real(kind=RKIND), pointer :: mass(:,:), mass_edge(:,:), exner(:,:), theta_m(:,:), zgrid(:,:), zz(:,:)
     real(kind=RKIND), pointer :: pressure_b(:,:), pressure_p(:,:), tend_th_phys(:,:)
     real(kind=RKIND), pointer :: tend_theta_phys(:,:), tend_theta_dyn(:,:)
-    real(kind=RKIND), pointer :: tend_u_phys(:,:), tend_ru_dyn(:,:)
+    real(kind=RKIND), pointer :: tend_u_phys(:,:), tend_ru_phys(:,:)
     real(kind=RKIND), pointer :: tend_uzonal(:,:), tend_umerid(:,:)
     real(kind=RKIND), pointer :: scalars(:,:,:), tend_scalars_phys(:,:,:), tend_scalars_dyn(:,:,:)
     real(kind=RKIND), pointer :: surface_pressure(:)
@@ -307,6 +311,11 @@ contains
     integer :: iCol,iLay,ithread,iScalar
     real(kind=RKIND):: coeff, tem1, tem2, rho1, rho2
     logical :: debug=.false.
+    integer, save :: ncall_p2m = 0
+    integer :: diag_unit, nbad
+    character(len=32) :: diag_fname
+    type(mpas_pool_type), pointer :: dbg_diag
+    real(kind=RKIND), pointer :: dbg_lat(:), dbg_lon(:), dbg_gw(:,:), dbg_ls(:,:), dbg_bl(:,:), dbg_ss(:,:), dbg_fd(:,:)
     character(len=*), parameter :: subname = 'atmos_coupling::ufs_mpas_physics_to_mpas'
 
     ! Get openMP information
@@ -556,13 +565,67 @@ contains
     ! Finally, compute wind tendency at grid-edges.
     call tend_toEdges(mesh_pool, tend_uzonal, tend_umerid, tend_u_phys)
 
-    ! Update MPAS tendency (ru)
-    call mpas_pool_get_array(tend_pool, 'u', tend_ru_dyn)
-    do iCol = 1,nEdgesSolve
+    ! Hand the mass-weighted edge-normal tendency to the dynamics through
+    ! tend_ru_physics, the field atm_compute_dyn_tend adds to tend_u at every RK
+    ! stage. (The generic tend%u is rebuilt from scratch each stage, so adding to
+    ! it has no effect.) UFS owns this field: it is assigned, not accumulated, once
+    ! per physics step, and persists between steps in the MPAS_UFS_DYCORE build.
+    call mpas_pool_get_array(tend_phys, 'tend_ru_physics', tend_ru_phys)
+    do iCol = 1,nEdges
        do iLay = 1, nVertLevels
-          tend_ru_dyn(iLay,iCol) = tend_ru_dyn(iLay,iCol) + tend_u_phys(iLay,iCol)*mass_edge(iLay,iCol)
+          tend_ru_phys(iLay,iCol) = tend_u_phys(iLay,iCol)*mass_edge(iLay,iCol)
        end do
     end do
+
+    ! Temporary diagnostics for the first few physics steps (per rank, to stderr):
+    ! range and NaN count of the physics wind tendency on owned cells, of the
+    ! halo cells filled by the exchange above, and of the edge tendency handed to
+    ! the dynamics. Remove once the momentum path is validated.
+    ncall_p2m = ncall_p2m + 1
+    if (ncall_p2m <= 3) then
+       write(diag_fname,'(a,i4.4)') 'bridge_diag.rank', domain_ptr % dminfo % my_proc_id
+       open(newunit=diag_unit, file=trim(diag_fname), position='append', action='write')
+       write(diag_unit,'(a,i0,a,i0,a,2es11.3,a,i0)') 'p2m step ', ncall_p2m, ' rank ', domain_ptr % dminfo % my_proc_id, &
+            ' dudt owned  min/max ', minval(physics_state % dudt(1:nCellsSolve,:)), maxval(physics_state % dudt(1:nCellsSolve,:)), &
+            ' nan ', count(physics_state % dudt(1:nCellsSolve,:) /= physics_state % dudt(1:nCellsSolve,:))
+       write(diag_unit,'(a,i0,a,i0,a,2es11.3,a,i0)') 'p2m step ', ncall_p2m, ' rank ', domain_ptr % dminfo % my_proc_id, &
+            ' dvdt owned  min/max ', minval(physics_state % dvdt(1:nCellsSolve,:)), maxval(physics_state % dvdt(1:nCellsSolve,:)), &
+            ' nan ', count(physics_state % dvdt(1:nCellsSolve,:) /= physics_state % dvdt(1:nCellsSolve,:))
+       if (nCells > nCellsSolve) then
+          write(diag_unit,'(a,i0,a,i0,a,2es11.3,a,i0)') 'p2m step ', ncall_p2m, ' rank ', domain_ptr % dminfo % my_proc_id, &
+               ' uzonal halo min/max ', minval(tend_uzonal(:,nCellsSolve+1:nCells)), maxval(tend_uzonal(:,nCellsSolve+1:nCells)), &
+               ' nan ', count(tend_uzonal(:,nCellsSolve+1:nCells) /= tend_uzonal(:,nCellsSolve+1:nCells))
+       end if
+       write(diag_unit,'(a,i0,a,i0,a,2es11.3,a,i0)') 'p2m step ', ncall_p2m, ' rank ', domain_ptr % dminfo % my_proc_id, &
+            ' tend_ru_physics owned edges min/max ', minval(tend_ru_phys(:,1:nEdgesSolve)), maxval(tend_ru_phys(:,1:nEdgesSolve)), &
+            ' nan ', count(tend_ru_phys(:,1:nEdgesSolve) /= tend_ru_phys(:,1:nEdgesSolve))
+       write(diag_unit,'(a,i0,a,i0,a,2es11.3)') 'p2m step ', ncall_p2m, ' rank ', domain_ptr % dminfo % my_proc_id, &
+            ' rho_edge owned edges min/max ', minval(mass_edge(:,1:nEdgesSolve)), maxval(mass_edge(:,1:nEdgesSolve))
+       ! Locate NaN points in the physics wind tendency and print the GWD components
+       ! (from the diag_physics pool, filled by ufs_mpas_phys_diag just before this call).
+       call mpas_pool_get_subpool(domain_ptr % blocklist % structs, 'diag_physics', dbg_diag)
+       call mpas_pool_get_array(mesh_pool, 'latCell', dbg_lat)
+       call mpas_pool_get_array(mesh_pool, 'lonCell', dbg_lon)
+       call mpas_pool_get_array(dbg_diag, 'dtaux3d',    dbg_gw)
+       call mpas_pool_get_array(dbg_diag, 'dtaux3d_ls', dbg_ls)
+       call mpas_pool_get_array(dbg_diag, 'dtaux3d_bl', dbg_bl)
+       call mpas_pool_get_array(dbg_diag, 'dtaux3d_ss', dbg_ss)
+       call mpas_pool_get_array(dbg_diag, 'dtaux3d_fd', dbg_fd)
+       nbad = 0
+       do iCol = 1, nCellsSolve
+          do iLay = 1, nVertLevels
+             if (physics_state % dudt(iCol,iLay) /= physics_state % dudt(iCol,iLay) .and. nbad < 20) then
+                nbad = nbad + 1
+                write(diag_unit,'(a,i0,a,i0,a,i0,a,i0,a,2f9.3,a,5es11.3)') 'p2m NaN rank ', domain_ptr % dminfo % my_proc_id, &
+                     ' iCol ', iCol, ' iLay ', iLay, ' nan-in-column ', &
+                     count(physics_state % dudt(iCol,:) /= physics_state % dudt(iCol,:)), &
+                     ' lat/lon ', dbg_lat(iCol)*57.29578_RKIND, dbg_lon(iCol)*57.29578_RKIND, &
+                     ' dudt_gw/ls/bl/ss/fd ', dbg_gw(iLay,iCol), dbg_ls(iLay,iCol), dbg_bl(iLay,iCol), dbg_ss(iLay,iCol), dbg_fd(iLay,iCol)
+             end if
+          end do
+       end do
+       close(diag_unit)
+    end if
 
     !> #####################################################################################
     !> Diagnostics

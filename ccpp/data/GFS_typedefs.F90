@@ -4704,6 +4704,10 @@ module GFS_typedefs
     if (Model%dycore_active == Model%dycore_mpas) then
        Model%nx = sum(blksz)
        Model%ny = 1
+       ! lonr/latr have no default; the MPAS host supplies an equivalent Gaussian-grid
+       ! count (see atmos_model.F90). drag_suite uses lonr to scale cleff.
+       if (present(gnx)) Model%lonr = gnx
+       if (present(gny)) Model%latr = gny
     end if
 
     !--- reference vertical pressure profile (dycore neutral)
