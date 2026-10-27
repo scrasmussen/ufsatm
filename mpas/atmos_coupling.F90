@@ -225,14 +225,15 @@ contains
   !> pool, we use tendencies from the CCPP Physics data containers.
   !>
   !> #########################################################################################
-  subroutine ufs_physics_to_mpas(stateout, mpas_from_ufs_cnst)
-    use GFS_typedefs,       only : GFS_stateout_type
+  subroutine ufs_physics_to_mpas(stateout, control, mpas_from_ufs_cnst)
+    use GFS_typedefs,       only : GFS_stateout_type, GFS_control_type
     use mpas_derived_types, only : mpas_pool_type
     use mpas_pool_routines, only : mpas_pool_get_subpool, mpas_pool_get_array, mpas_pool_get_dimension, mpas_pool_get_config
     use mpas_constants,     only : rv, rgas, gravity
 
     ! Arguments
     type(GFS_stateout_type), intent(in) :: stateout
+    type(GFS_control_type),  intent(in) :: control
     integer, pointer,        intent(in) :: mpas_from_ufs_cnst(:)
 
     ! Locals
@@ -381,10 +382,12 @@ contains
               drdt = (dq*(1._R8KIND - qv0) + qx0*dqv) / den      ! d(mixing ratio)/dt
             else
               drdt = dq                                         ! e.g. sgs_tke
-              ! TKE is updated in place by the PBL scheme (no tendency), so form one here.
+              ! MYNN-EDMF updates TKE in place (qke_adv = gq0(:,:,ntke)) with no tendency, so
+              ! form one here. Other PBL schemes (e.g. satmedmfvdifq via GFS_PBL_generic_post)
+              ! return the TKE tendency in dqdt like any other tracer and leave gq0 unchanged.
               ! DJS2026: MYNN-EDMF outputs the updated SGS TKE scaled by 2x. Is this needed
               ! in MYNN?
-              if (associated(index_sgs_tke)) then
+              if (associated(index_sgs_tke) .and. control % do_mynnedmf) then
                  if (iTracer == index_sgs_tke) then
                     drdt = (stateout % gq0(iCol,iLay,mpas_from_ufs_cnst(iTracer)) - &
                             max(0._RKIND, scalars(iTracer,iLay,iCol))) / config_dt
@@ -871,19 +874,26 @@ contains
 !> #########################################################################################
   subroutine ufs_mpas_sfc_to_physics(surface, control)
     use GFS_typedefs,         only : GFS_sfcprop_type, GFS_control_type
-    use mpas_derived_types,   only : mpas_pool_type
+    use mpas_derived_types,   only : mpas_pool_type, MPAS_LOG_CRIT, MPAS_LOG_WARN
     use mpas_pool_routines,   only : mpas_pool_get_subpool, mpas_pool_get_dimension, mpas_pool_get_array
     use mpas_kind_types,      only : RKIND, StrKIND
+    use mpas_log,             only : mpas_log_write
+    use noahmp_tables,        only : read_mp_table_parameters, bexp_table, smcmax_table, psisat_table
+    use physcons,             only : con_g, con_hfus, con_t0c, con_tice
 
     ! Arguments
     type(GFS_control_type),      intent(in) :: control
     type(GFS_sfcprop_type),      intent(inout) :: surface
     ! Locals
     type(mpas_pool_type), pointer :: sfc_input, mesh, diag_phys
-    integer :: iCol, iLev, ithread
+    integer :: iCol, iLev, ithread, soiltyp, errflg, k
+    real(RKIND) :: bexp, smcmax, psisat, fk, w
+    real(RKIND), allocatable :: zmid(:)
+    logical :: remap_soil
+    character(len=512) :: errmsg
     integer, pointer :: nThreads, cellSolveThreadStart(:), cellSolveThreadEnd(:)
     integer, pointer :: isltyp(:), ivgtyp(:), landmask(:), nSoilLevels
-    real(RKIND), pointer :: dzs(:,:), sh2o(:,:), smois(:,:), tslb(:,:)
+    real(RKIND), pointer :: dzs(:,:), zs(:,:), sh2o(:,:), smois(:,:), tslb(:,:)
     real(RKIND), pointer :: albbck(:), skintemp(:), snow(:), snowc(:), snowh(:)
     real(RKIND), pointer :: sst(:), tmn(:), vegfra(:), seaice(:), xice(:), xland(:), znt(:), sfc_albedo(:), canwat(:)
     real(RKIND), pointer :: greenfrac(:,:), albedo12m(:,:), landusef(:,:), soilf(:,:), sfc_emiss(:)
@@ -918,6 +928,7 @@ contains
     call mpas_pool_get_array(sfc_input, 'ter',       ter)       !dim (nCells); terrain height (m)
     call mpas_pool_get_array(sfc_input, 'tmn' ,      tmn)       !dim (nCells Time); deep soil temperature (K)
     call mpas_pool_get_array(sfc_input, 'tslb',      tslb)      !dim (nSoilLevels nCells Time); soil layer temperature (K)
+    call mpas_pool_get_array(sfc_input, 'zs',        zs)        !dim (nSoilLevels nCells Time); depth of soil levels (m)
     call mpas_pool_get_array(sfc_input, 'vegfra',    vegfra)    !dim (nCells Time); vegetation fraction (percent)
     call mpas_pool_get_array(sfc_input, 'seaice',    seaice)    !dim (nCells Time); sea-ice flag (0=no seaice; =1 otherwise)
     call mpas_pool_get_array(sfc_input, 'xice',      xice)      !dim (nCells Time); fractional area coverage of sea-ice
@@ -933,6 +944,16 @@ contains
     call mpas_pool_get_array(diag_phys, 'znt',       znt)       !dim (nCells); roughness length (m)
     call mpas_pool_get_array(diag_phys, 'sfc_albedo',sfc_albedo)!dim (nCells); surface albedo (fraction)
     call mpas_pool_get_array(diag_phys, 'sfc_emiss', sfc_emiss)
+
+    ! Noah/Noah-MP soil layers (Model%zs = layer bottoms, negative down) need not match the
+    ! IC's soil levels (9 RUC levels in RUC-style ICs), so interpolate the IC soil state to
+    ! the physics layer centers. RUC (lsoil = nSoilLevels) keeps the direct copy.
+    remap_soil = (control % lsm == control % lsm_noah .or. control % lsm == control % lsm_noahmp) &
+                 .and. nSoilLevels > 1 .and. nSoilLevels /= control % lsoil
+    if (remap_soil) then
+      allocate(zmid(control % lsoil))
+      zmid(:) = -control % zs(1:control % lsoil) - 0.5_RKIND*control % dzs(1:control % lsoil)
+    end if
 
     do ithread = 1,nThreads
       do iCol = cellSolveThreadStart(ithread),cellSolveThreadEnd(ithread)
@@ -1004,16 +1025,130 @@ contains
             surface % tslb(iCol, iLev)  = tslb(iLev, iCol)
           end do
         end if
-        ! smc/stc are allocated for every LSM, but only with Model%lsoil levels
+        ! smc/stc/slc are allocated for every LSM, but only with Model%lsoil levels
         ! (4 for Noah/Noah-MP) -- not nSoilLevels, which is the MPAS IC's own soil
-        ! discretization (9 here, a RUC-style IC) and can exceed Model%lsoil, so
-        ! cap the loop or this overruns the smc/stc arrays.
-        do iLev=1, min(nSoilLevels, control % lsoil)
-          surface % smc(iCol, iLev) = smois(iLev, iCol)
-          surface % stc(iCol, iLev) = tslb(iLev, iCol)
-       end do
+        ! discretization (9 here, a RUC-style IC).
+        if (remap_soil) then
+          if (landmask(iCol) == 1) then
+            if (any(zs(2:nSoilLevels,iCol) <= zs(1:nSoilLevels-1,iCol))) then
+              call mpas_log_write(subname // ' ERROR: IC soil level depths (zs) are not increasing', &
+                                  messageType=MPAS_LOG_CRIT)
+            end if
+          end if
+          ! Linear interpolation in depth; constant beyond the shallowest/deepest IC level.
+          do iLev = 1, control % lsoil
+            if (zmid(iLev) <= zs(1,iCol)) then
+              k = 1
+              w = 1._RKIND
+            elseif (zmid(iLev) >= zs(nSoilLevels,iCol)) then
+              k = nSoilLevels - 1
+              w = 0._RKIND
+            else
+              k = 1
+              do while (zs(k+1,iCol) < zmid(iLev))
+                k = k + 1
+              end do
+              w = (zs(k+1,iCol) - zmid(iLev)) / (zs(k+1,iCol) - zs(k,iCol))
+            end if
+            surface % smc(iCol, iLev) = w*smois(k,iCol) + (1._RKIND-w)*smois(k+1,iCol)
+            surface % stc(iCol, iLev) = w*tslb(k,iCol)  + (1._RKIND-w)*tslb(k+1,iCol)
+            surface % slc(iCol, iLev) = w*sh2o(k,iCol)  + (1._RKIND-w)*sh2o(k+1,iCol)
+          end do
+        else
+          do iLev=1, min(nSoilLevels, control % lsoil)
+            surface % smc(iCol, iLev) = smois(iLev, iCol)
+            surface % stc(iCol, iLev) = tslb(iLev, iCol)
+            surface % slc(iCol, iLev) = sh2o(iLev, iCol)
+          end do
+        end if
       end do
     end do
+
+    ! Liquid soil water for Noah-MP. RUC-style MPAS ICs carry sh2o = 0 everywhere, so where
+    ! the IC gives no liquid water, diagnose it from smc/stc with the frozen-soil relation used
+    ! by MPAS's own Noah-MP init (mpas_atmphys_lsm_noahmpinit.F). Glacier points are reset by
+    ! GFS_phys_time_vary_init (smc=1, slc=0).
+    if (control % lsm == control % lsm_noahmp) then
+      call read_mp_table_parameters(errmsg, errflg)
+      if (errflg /= 0) call mpas_log_write(subname // ' ERROR: ' // trim(errmsg), messageType=MPAS_LOG_CRIT)
+      do ithread = 1,nThreads
+        do iCol = cellSolveThreadStart(ithread),cellSolveThreadEnd(ithread)
+          if (landmask(iCol) /= 1) cycle
+          if (any(surface % slc(iCol,:) > 0._RKIND)) cycle
+          soiltyp = surface % stype(iCol)
+          if (soiltyp >= 1 .and. soiltyp <= size(bexp_table)) then
+            bexp   = bexp_table(soiltyp)
+            smcmax = smcmax_table(soiltyp)
+            psisat = psisat_table(soiltyp)
+          else
+            bexp   = -1._RKIND
+            smcmax = -1._RKIND
+            psisat = -1._RKIND
+          end if
+          do iLev = 1, control % lsoil
+            if (surface % stc(iCol,iLev) < con_t0c .and. &
+                bexp > 0._RKIND .and. smcmax > 0._RKIND .and. psisat > 0._RKIND) then
+              ! Supercooled liquid water in frozen soil
+              fk = (((con_hfus/(con_g*(-psisat)))*((surface % stc(iCol,iLev)-con_t0c)/surface % stc(iCol,iLev))) &
+                   **(-1._RKIND/bexp))*smcmax
+              surface % slc(iCol,iLev) = min(max(fk, 0.02_RKIND), surface % smc(iCol,iLev))
+            else
+              surface % slc(iCol,iLev) = surface % smc(iCol,iLev)
+            end if
+          end do
+        end do
+      end do
+    end if
+
+    ! NSST. MPAS ICs carry no NSST state, so always initialize it as FV3 does for NSST spin-up
+    ! (nstf_name(2) = 1, fv3atm_sfc_io.F90), except tref is kept at or above the freezing point
+    ! of seawater: the IC sst is a copy of skintemp (as low as ~230 K under sea ice), and
+    ! uncoupled NSST never updates tref after initialization.
+    if (control % nstf_name(1) > 0) then
+      if (control % nstf_name(2) /= 1) then
+        call mpas_log_write(subname // ' WARNING: MPAS ICs have no NSST state; initializing ' // &
+                            'it as for NSST spin-up (nstf_name(2) = 1)', messageType=MPAS_LOG_WARN)
+      end if
+      do ithread = 1,nThreads
+        do iCol = cellSolveThreadStart(ithread),cellSolveThreadEnd(ithread)
+          surface % tref(iCol)    = max(con_tice, surface % tsfco(iCol))
+          surface % z_c(iCol)     = 0._RKIND
+          surface % c_0(iCol)     = 0._RKIND
+          surface % c_d(iCol)     = 0._RKIND
+          surface % w_0(iCol)     = 0._RKIND
+          surface % w_d(iCol)     = 0._RKIND
+          surface % xt(iCol)      = 0._RKIND
+          surface % xs(iCol)      = 0._RKIND
+          surface % xu(iCol)      = 0._RKIND
+          surface % xv(iCol)      = 0._RKIND
+          surface % xz(iCol)      = 20._RKIND
+          surface % zm(iCol)      = 0._RKIND
+          surface % xtts(iCol)    = 0._RKIND
+          surface % xzts(iCol)    = 0._RKIND
+          surface % d_conv(iCol)  = 0._RKIND
+          surface % ifd(iCol)     = 0._RKIND
+          surface % dt_cool(iCol) = 0._RKIND
+          surface % qrain(iCol)   = 0._RKIND
+        end do
+      end do
+    end if
+
+    ! GFS sea ice (sfc_sice); RUC initializes its own ice state. MPAS ICs carry no ice thickness
+    ! or internal ice temperature. Thickness follows GFS surface cycling with an ice concentration
+    ! analysis (sfcsub.F: 3 m x concentration; sfc_sice bounds it to [0.1, 8] m). Ice layer
+    ! temperatures follow FV3's cold-start fallback from soil layers 1-2 (fv3atm_sfc_io.F90).
+    if (control % lsm /= control % lsm_ruc) then
+      do ithread = 1,nThreads
+        do iCol = cellSolveThreadStart(ithread),cellSolveThreadEnd(ithread)
+          if (landmask(iCol) /= 1 .and. surface % fice(iCol) >= control % min_seaice) then
+            surface % hice(iCol) = 3._RKIND * surface % fice(iCol)
+          end if
+          do iLev = 1, min(2, control % kice)
+            surface % tiice(iCol,iLev) = max(173._RKIND, min(con_tice, surface % stc(iCol,iLev)))
+          end do
+        end do
+      end do
+    end if
 
     !dzs is defined for every cell in the input data, but the variable in GFS_typedefs only has soil depth as a dimension (is
     !uniform for every grid cell)
@@ -1024,6 +1159,7 @@ contains
     !  control % zs(iLev) = control % zs(iLev-1) - control % dzs(iLev)
     !end do
 
+    if (allocated(zmid)) deallocate(zmid)
 
   end subroutine ufs_mpas_sfc_to_physics
 
@@ -1490,7 +1626,7 @@ contains
     use mpas_derived_types,   only : mpas_pool_type
     use mpas_pool_routines,   only : mpas_pool_get_dimension, mpas_pool_get_array, mpas_pool_get_subpool
     use GFS_typedefs,         only : GFS_statein_type
-    use mpas_constants,       only : gravity
+    use mpas_constants,       only : gravity, rgas, cp, p0
 
     type(GFS_statein_type), intent(inout) :: statein
     real(kind=RKIND), intent(in) :: qv(:,:)
@@ -1595,6 +1731,11 @@ contains
              rho_moist = rho(iCol,iLay) * (1.+qv(iLay,iCol)) ! Moist-density
              statein % prsi(iCol,iLay)  = statein % prsi(iCol,iLay+1) + &
                   gravity*rho_moist*statein % dzgrid(iCol,iLay)
+          end do
+          ! Exner function at layer-interfaces. GFS surface schemes use prsik(:,1)/prslk(:,1)
+          ! (FV3: atmosphere.F90::atmos_phys_driver_statein). Same kappa as MPAS exner (prslk).
+          do iLay = 1,nVertLevels+1
+             statein % prsik(iCol,iLay) = (statein % prsi(iCol,iLay)/p0)**(rgas/cp)
           end do
           ! Pressure at layer-centers
           do iLay = nVertLevels,1,-1

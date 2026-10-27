@@ -457,7 +457,7 @@ contains
     call ufs_mpas_phys_diag(statein, control, radiation, diag, tbd, surface)
 
     ! Prepare MPAS dycore inputs with CCPP physics outputs.
-    call ufs_physics_to_mpas(stateout, mpas_from_ufs_cnst)
+    call ufs_physics_to_mpas(stateout, control, mpas_from_ufs_cnst)
 
   end subroutine atmos_model_radiation_physics
 
